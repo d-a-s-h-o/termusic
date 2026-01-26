@@ -392,7 +392,7 @@ fn import_opml_feeds(xml: &str) -> Result<Vec<PodcastFeed>> {
     let opml = OPML::from_str(xml)?;
     let mut feeds = Vec::new();
     for pod in opml.body.outlines {
-        if pod.xml_url.is_some() {
+        if let Some(url) = pod.xml_url {
             // match against title attribute first -- if this is
             // not set or empty, then match against the text
             // attribute; this must be set, but can be empty
@@ -403,7 +403,7 @@ fn import_opml_feeds(xml: &str) -> Result<Vec<PodcastFeed>> {
                     Some(pod.text)
                 }
             });
-            feeds.push(PodcastFeed::new(None, pod.xml_url.unwrap(), title));
+            feeds.push(PodcastFeed::new(None, url, title));
         }
     }
     Ok(feeds)

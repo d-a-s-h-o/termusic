@@ -853,8 +853,8 @@ impl Model {
                 .ok_or_else(|| anyhow!("failed to find the podcast selected for deletion."))?;
 
             for ep in &mut podcast_selected.episodes {
-                if ep.path.is_some() {
-                    match std::fs::remove_file(ep.path.as_ref().unwrap()) {
+                if let Some(path) = ep.path.as_ref() {
+                    match std::fs::remove_file(path) {
                         Ok(()) => {
                             eps_to_remove.push(ep.id);
                             ep.path = None;
