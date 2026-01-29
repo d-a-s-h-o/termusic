@@ -5,6 +5,7 @@ use serde_json::Value;
 // use std::io::Write;
 use reqwest::{Client, ClientBuilder, StatusCode};
 use std::time::Duration;
+use ytd_rs::{Arg, YoutubeDL};
 
 const INVIDIOUS_INSTANCE_LIST: [&str; 5] = [
     "https://inv.nadeko.net",
@@ -66,52 +67,16 @@ impl Default for Instance {
 
 impl Instance {
     pub async fn new(query: &str) -> Result<(Self, Vec<YoutubeVideo>)> {
+        // Use yt-dlp for search with flat-playlist option
+        let video_result = Self::search_with_ytdlp(query, 1).await?;
+        
         let client = ClientBuilder::new()
             .timeout(Duration::from_secs(10))
             .build()?;
 
-        let mut domain = String::new();
-        let mut domains = vec![];
-
-        // prefor fetch invidious instance from website, but will provide 7 backups
-        if let Ok(domain_list) = Self::get_invidious_instance_list(&client).await {
-            domains = domain_list;
-        } else {
-            for item in &INVIDIOUS_INSTANCE_LIST {
-                domains.push((*item).to_string());
-            }
-        }
-
-        domains.shuffle(&mut rand::rng());
-
-        let mut video_result: Vec<YoutubeVideo> = Vec::new();
-        for v in domains {
-            let url = format!("{v}/api/v1/search");
-
-            let query_vec = vec![
-                ("q", query),
-                ("page", "1"),
-                ("type", "video"),
-                ("sort_by", "relevance"),
-            ];
-            if let Ok(result) = client.get(&url).query(&query_vec).send().await
-                && result.status() == 200
-                && let Ok(text) = result.text().await
-                && let Some(vr) = Self::parse_youtube_options(&text)
-            {
-                video_result = vr;
-                domain = v;
-                break;
-            }
-        }
-        if domain.len() < 2 {
-            bail!("Something is wrong with your connection or all 7 invidious servers are down.");
-        }
-
-        let domain = Some(domain);
         Ok((
             Self {
-                domain,
+                domain: Some("yt-dlp".to_string()),
                 client,
                 query: Some(query.to_string()),
             },
@@ -119,36 +84,70 @@ impl Instance {
         ))
     }
 
-    // GetSearchQuery fetches query result from an Invidious instance.
-    pub async fn get_search_query(&self, page: u32) -> Result<Vec<YoutubeVideo>> {
-        if self.domain.is_none() {
-            bail!("No server available");
+    /// Search YouTube using yt-dlp with --flat-playlist for fast metadata-only search
+    async fn search_with_ytdlp(query: &str, page: u32) -> Result<Vec<YoutubeVideo>> {
+        // yt-dlp doesn't have native pagination, so we fetch more results and skip based on page
+        const RESULTS_PER_PAGE: u32 = 20;
+        let total_results = page * RESULTS_PER_PAGE;
+        
+        let search_query = format!("ytsearch{total_results}:{query}");
+        let temp_dir = std::env::temp_dir();
+        
+        let args = vec![
+            Arg::new("--flat-playlist"),
+            Arg::new("--dump-json"),
+            Arg::new("--skip-download"),
+            Arg::new("--no-warnings"),
+        ];
+        
+        let ytd = YoutubeDL::new(&temp_dir, args, &search_query)?;
+        
+        // Run yt-dlp in a blocking task since it's synchronous
+        let result = tokio::task::spawn_blocking(move || ytd.download()).await??;
+        
+        // Parse the output - each line is a JSON object
+        let output = result.output();
+        let mut videos = Vec::new();
+        
+        for line in output.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            
+            if let Ok(value) = serde_json::from_str::<Value>(line) {
+                if let Some(video) = Self::parse_ytdlp_item(&value) {
+                    videos.push(video);
+                }
+            }
         }
-        let url = format!(
-            "{}/api/v1/search",
-            self.domain
-                .as_ref()
-                .ok_or(anyhow!("error in domain name"))?
-        );
+        
+        // Return only the last page of results for pagination
+        let start_idx = ((page - 1) * RESULTS_PER_PAGE) as usize;
+        let videos: Vec<YoutubeVideo> = videos.into_iter().skip(start_idx).collect();
+        
+        Ok(videos)
+    }
+    
+    /// Parse a single video entry from yt-dlp JSON output
+    fn parse_ytdlp_item(value: &Value) -> Option<YoutubeVideo> {
+        let title = value.get("title")?.as_str()?.to_owned();
+        let video_id = value.get("id")?.as_str()?.to_owned();
+        let length_seconds = value.get("duration")?.as_u64().unwrap_or(0);
+        
+        Some(YoutubeVideo {
+            title,
+            length_seconds,
+            video_id,
+        })
+    }
 
+    // GetSearchQuery fetches query result from yt-dlp for the specified page.
+    pub async fn get_search_query(&self, page: u32) -> Result<Vec<YoutubeVideo>> {
         let Some(query) = &self.query else {
             bail!("No query string found")
         };
-
-        let result = self
-            .client
-            .get(url)
-            .query(&[("q", query), ("page", &page.to_string())])
-            .send()
-            .await?;
-
-        match result.status() {
-            StatusCode::OK => match result.text().await {
-                Ok(text) => Self::parse_youtube_options(&text).ok_or_else(|| anyhow!("None Error")),
-                Err(e) => bail!("Error during search: {}", e),
-            },
-            _ => bail!("Error during search"),
-        }
+        
+        Self::search_with_ytdlp(query, page).await
     }
 
     // GetSuggestions returns video suggestions based on prefix strings. This is the
@@ -169,26 +168,34 @@ impl Instance {
 
     // GetTrendingMusic fetch music trending based on region.
     // Region (ISO 3166 country code) can be provided in the argument.
+    // Note: This still uses Invidious API as yt-dlp doesn't have a trending feature
     pub async fn get_trending_music(&self, region: &str) -> Result<Vec<YoutubeVideo>> {
-        if self.domain.is_none() {
-            bail!("No server available");
+        // Fallback to Invidious for trending music since yt-dlp doesn't support this
+        let mut domains = vec![];
+        
+        if let Ok(domain_list) = Self::get_invidious_instance_list(&self.client).await {
+            domains = domain_list;
+        } else {
+            for item in &INVIDIOUS_INSTANCE_LIST {
+                domains.push((*item).to_string());
+            }
         }
-        let url = format!(
-            "{}/api/v1/trending?type=music&region={region}",
-            self.domain
-                .as_ref()
-                .ok_or(anyhow!("error in domain names"))?
-        );
 
-        let result = self.client.get(url).send().await?;
+        domains.shuffle(&mut rand::rng());
 
-        match result.status() {
-            StatusCode::OK => match result.text().await {
-                Ok(text) => Self::parse_youtube_options(&text).ok_or_else(|| anyhow!("None Error")),
-                _ => bail!("Error during search"),
-            },
-            _ => bail!("Error during search"),
+        for domain in domains {
+            let url = format!("{domain}/api/v1/trending?type=music&region={region}");
+            
+            if let Ok(result) = self.client.get(&url).send().await
+                && result.status() == StatusCode::OK
+                && let Ok(text) = result.text().await
+                && let Some(videos) = Self::parse_youtube_options(&text)
+            {
+                return Ok(videos);
+            }
         }
+        
+        bail!("Unable to fetch trending music from any Invidious instance")
     }
 
     fn parse_youtube_options(data: &str) -> Option<Vec<YoutubeVideo>> {
