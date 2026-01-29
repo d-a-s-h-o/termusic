@@ -110,7 +110,10 @@ impl Model {
         // download from search result here
         if let Ok(item) = self.youtube_options.get_by_index(index) {
             let url = format!("https://www.youtube.com/watch?v={}", item.video_id);
-            self.youtube_dl(url.as_ref()).context("YTDL Download")?;
+            // Prepare fallback URL using the Invidious instance
+            let fallback_url = self.youtube_options.invidious_instance.domain.as_ref()
+                .map(|domain| format!("{}/watch?v={}", domain, item.video_id));
+            self.youtube_dl(url.as_ref(), fallback_url.as_deref()).context("YTDL Download")?;
         }
         Ok(())
     }
@@ -240,7 +243,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub fn youtube_dl(&mut self, url: &str) -> Result<()> {
+    pub fn youtube_dl(&mut self, url: &str, fallback_url: Option<&str>) -> Result<()> {
         let mut path: PathBuf = std::env::temp_dir();
         if let Ok(State::One(StateValue::String(node_id))) = self.app.state(&Id::Library) {
             path = get_parent_folder(Path::new(&node_id)).to_path_buf();
@@ -252,7 +255,8 @@ impl Model {
             // Arg::new_with_arg("--audio-format", "vorbis"),
             Arg::new_with_arg("--audio-format", "mp3"),
             Arg::new("--add-metadata"),
-            Arg::new("--embed-thumbnail"),
+            // Don't embed thumbnail to avoid downloading cover art
+            // Arg::new("--embed-thumbnail"),
             Arg::new_with_arg("--metadata-from-title", "%(artist) - %(title)s"),
             #[cfg(target_os = "windows")]
             Arg::new("--restrict-filenames"),
@@ -268,11 +272,12 @@ impl Model {
             args.append(&mut extra_args_parsed);
         }
 
-        let ytd = YoutubeDL::new(&path, args, url)?;
+        let ytd = YoutubeDL::new(&path, args.clone(), url)?;
         let tx = self.tx_to_main.clone();
 
         // avoid full string clones when sending via a channel
         let url: Arc<str> = Arc::from(url);
+        let fallback_url: Option<Arc<str>> = fallback_url.map(Arc::from);
 
         thread::spawn(move || -> Result<()> {
             tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Start(
@@ -280,7 +285,8 @@ impl Model {
                 "youtube music".to_string(),
             ))))
             .ok();
-            // start download
+            
+            // Try primary URL with yt-dlp first
             let download = ytd.download();
 
             // check what the result is and print out the path to the download or the error
@@ -312,12 +318,62 @@ impl Model {
                     }
                 }
                 Err(e) => {
-                    tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Err(
-                        url.clone(),
-                        "youtube music".to_string(),
-                        e.to_string(),
-                    ))))
-                    .ok();
+                    // If primary download fails and we have a fallback URL, try that
+                    if let Some(ref fallback) = fallback_url {
+                        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Err(
+                            url.clone(),
+                            "youtube music".to_string(),
+                            format!("Primary download failed, trying fallback: {}", e),
+                        ))))
+                        .ok();
+                        
+                        // Try fallback URL
+                        if let Ok(ytd_fallback) = YoutubeDL::new(&path, args, fallback.as_ref()) {
+                            match ytd_fallback.download() {
+                                Ok(result) => {
+                                    tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Success(
+                                        url.clone(),
+                                    ))))
+                                    .ok();
+                                    
+                                    if let Some(file_fullname) =
+                                        extract_filepath(result.output(), &path.to_string_lossy())
+                                    {
+                                        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Completed(
+                                            url,
+                                            Some(file_fullname.clone()),
+                                        ))))
+                                        .ok();
+
+                                        remove_downloaded_json(&path, &file_fullname);
+                                        embed_downloaded_lrc(&path, &file_fullname);
+                                    } else {
+                                        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Completed(
+                                            url, None,
+                                        ))))
+                                        .ok();
+                                    }
+                                    return Ok(());
+                                }
+                                Err(fallback_err) => {
+                                    tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Err(
+                                        url.clone(),
+                                        "youtube music".to_string(),
+                                        format!("Both primary and fallback failed. Primary: {} Fallback: {}", e, fallback_err),
+                                    ))))
+                                    .ok();
+                                }
+                            }
+                        }
+                    } else {
+                        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Err(
+                            url.clone(),
+                            "youtube music".to_string(),
+                            e.to_string(),
+                        ))))
+                        .ok();
+                    }
+                    
                     tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Completed(
                         url, None,
                     ))))

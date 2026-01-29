@@ -678,7 +678,7 @@ impl Model {
                     assert!(self.app.umount(&Id::YoutubeSearchInputPopup).is_ok());
                 }
                 if url.starts_with("http") {
-                    match self.youtube_dl(&url) {
+                    match self.youtube_dl(&url, None) {
                         Ok(()) => {}
                         Err(e) => {
                             self.mount_error_popup(e.context("youtube-dl download"));
