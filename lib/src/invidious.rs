@@ -132,7 +132,7 @@ impl Instance {
     fn parse_ytdlp_item(value: &Value) -> Option<YoutubeVideo> {
         let title = value.get("title")?.as_str()?.to_owned();
         let video_id = value.get("id")?.as_str()?.to_owned();
-        let length_seconds = value.get("duration")?.as_u64().unwrap_or(0);
+        let length_seconds = value.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
         
         Some(YoutubeVideo {
             title,
@@ -274,5 +274,53 @@ impl Instance {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_ytdlp_item() {
+        let json_str = r#"{
+            "id": "dQw4w9WgXcQ",
+            "title": "Rick Astley - Never Gonna Give You Up",
+            "duration": 212
+        }"#;
+        
+        let value: Value = serde_json::from_str(json_str).unwrap();
+        let video = Instance::parse_ytdlp_item(&value).unwrap();
+        
+        assert_eq!(video.video_id, "dQw4w9WgXcQ");
+        assert_eq!(video.title, "Rick Astley - Never Gonna Give You Up");
+        assert_eq!(video.length_seconds, 212);
+    }
+
+    #[test]
+    fn test_parse_ytdlp_item_no_duration() {
+        let json_str = r#"{
+            "id": "test123",
+            "title": "Test Video"
+        }"#;
+        
+        let value: Value = serde_json::from_str(json_str).unwrap();
+        let video = Instance::parse_ytdlp_item(&value).unwrap();
+        
+        assert_eq!(video.video_id, "test123");
+        assert_eq!(video.title, "Test Video");
+        assert_eq!(video.length_seconds, 0);
+    }
+
+    #[test]
+    fn test_parse_ytdlp_item_missing_fields() {
+        let json_str = r#"{
+            "id": "test123"
+        }"#;
+        
+        let value: Value = serde_json::from_str(json_str).unwrap();
+        let video = Instance::parse_ytdlp_item(&value);
+        
+        assert!(video.is_none());
     }
 }
