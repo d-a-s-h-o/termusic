@@ -88,6 +88,16 @@ impl Instance {
     async fn search_with_ytdlp(query: &str, page: u32) -> Result<Vec<YoutubeVideo>> {
         // yt-dlp doesn't have native pagination, so we fetch more results and skip based on page
         const RESULTS_PER_PAGE: u32 = 20;
+        const MAX_PAGE: u32 = 100; // Limit to prevent excessive results
+        
+        if page == 0 {
+            bail!("Page number must be at least 1");
+        }
+        
+        if page > MAX_PAGE {
+            bail!("Page number too large (max {})", MAX_PAGE);
+        }
+        
         let total_results = page * RESULTS_PER_PAGE;
         
         let search_query = format!("ytsearch{total_results}:{query}");
@@ -322,5 +332,18 @@ mod tests {
         let video = Instance::parse_ytdlp_item(&value);
         
         assert!(video.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_search_with_ytdlp_page_validation() {
+        // Test page 0 is rejected
+        let result = Instance::search_with_ytdlp("test", 0).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least 1"));
+
+        // Test page > MAX_PAGE is rejected  
+        let result = Instance::search_with_ytdlp("test", 101).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too large"));
     }
 }
