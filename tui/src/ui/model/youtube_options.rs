@@ -105,6 +105,36 @@ impl YoutubeOptions {
     }
 }
 
+/// Helper function to handle successful download completion
+fn handle_download_success(
+    tx: &tokio::sync::mpsc::UnboundedSender<Msg>,
+    url: Arc<str>,
+    output: &str,
+    path: &Path,
+) {
+    tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Success(
+        url.clone(),
+    ))))
+    .ok();
+    
+    if let Some(file_fullname) = extract_filepath(output, &path.to_string_lossy()) {
+        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Completed(
+            url,
+            Some(file_fullname.clone()),
+        ))))
+        .ok();
+
+        remove_downloaded_json(path, &file_fullname);
+        embed_downloaded_lrc(path, &file_fullname);
+    } else {
+        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Completed(
+            url,
+            None,
+        ))))
+        .ok();
+    }
+}
+
 impl Model {
     pub fn youtube_options_download(&mut self, index: usize) -> Result<()> {
         // download from search result here
@@ -292,30 +322,7 @@ impl Model {
             // check what the result is and print out the path to the download or the error
             match download {
                 Ok(result) => {
-                    tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Success(
-                        url.clone(),
-                    ))))
-                    .ok();
-                    // here we extract the full file name from download output
-                    if let Some(file_fullname) =
-                        extract_filepath(result.output(), &path.to_string_lossy())
-                    {
-                        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Completed(
-                            url,
-                            Some(file_fullname.clone()),
-                        ))))
-                        .ok();
-
-                        // here we remove downloaded live_chat.json file
-                        remove_downloaded_json(&path, &file_fullname);
-
-                        embed_downloaded_lrc(&path, &file_fullname);
-                    } else {
-                        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Completed(
-                            url, None,
-                        ))))
-                        .ok();
-                    }
+                    handle_download_success(&tx, url, result.output(), &path);
                 }
                 Err(e) => {
                     // If primary download fails and we have a fallback URL, try that
@@ -328,41 +335,30 @@ impl Model {
                         .ok();
                         
                         // Try fallback URL
-                        if let Ok(ytd_fallback) = YoutubeDL::new(&path, args, fallback.as_ref()) {
-                            match ytd_fallback.download() {
-                                Ok(result) => {
-                                    tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Success(
-                                        url.clone(),
-                                    ))))
-                                    .ok();
-                                    
-                                    if let Some(file_fullname) =
-                                        extract_filepath(result.output(), &path.to_string_lossy())
-                                    {
-                                        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Completed(
-                                            url,
-                                            Some(file_fullname.clone()),
-                                        ))))
-                                        .ok();
-
-                                        remove_downloaded_json(&path, &file_fullname);
-                                        embed_downloaded_lrc(&path, &file_fullname);
-                                    } else {
-                                        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Completed(
-                                            url, None,
+                        match YoutubeDL::new(&path, args, fallback.as_ref()) {
+                            Ok(ytd_fallback) => {
+                                match ytd_fallback.download() {
+                                    Ok(result) => {
+                                        handle_download_success(&tx, url, result.output(), &path);
+                                        return Ok(());
+                                    }
+                                    Err(fallback_err) => {
+                                        tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Err(
+                                            url.clone(),
+                                            "youtube music".to_string(),
+                                            format!("Both primary and fallback failed. Primary: {} Fallback: {}", e, fallback_err),
                                         ))))
                                         .ok();
                                     }
-                                    return Ok(());
                                 }
-                                Err(fallback_err) => {
-                                    tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Err(
-                                        url.clone(),
-                                        "youtube music".to_string(),
-                                        format!("Both primary and fallback failed. Primary: {} Fallback: {}", e, fallback_err),
-                                    ))))
-                                    .ok();
-                                }
+                            }
+                            Err(init_err) => {
+                                tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Err(
+                                    url.clone(),
+                                    "youtube music".to_string(),
+                                    format!("Primary download failed and fallback initialization failed. Primary: {} Fallback init: {}", e, init_err),
+                                ))))
+                                .ok();
                             }
                         }
                     } else {
@@ -374,6 +370,7 @@ impl Model {
                         .ok();
                     }
                     
+                    // Send completion message on error
                     tx.send(Msg::YoutubeSearch(YSMsg::Download(YTDLMsg::Completed(
                         url, None,
                     ))))
