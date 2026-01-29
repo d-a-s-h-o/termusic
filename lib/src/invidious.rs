@@ -76,7 +76,7 @@ impl Instance {
 
         Ok((
             Self {
-                domain: Some("yt-dlp".to_string()),
+                domain: None, // yt-dlp doesn't use a domain
                 client,
                 query: Some(query.to_string()),
             },
@@ -86,9 +86,16 @@ impl Instance {
 
     /// Search YouTube using yt-dlp with --flat-playlist for fast metadata-only search
     async fn search_with_ytdlp(query: &str, page: u32) -> Result<Vec<YoutubeVideo>> {
-        // yt-dlp doesn't have native pagination, so we fetch more results and skip based on page
+        // Validate query is not empty
+        let query = query.trim();
+        if query.is_empty() {
+            bail!("Search query cannot be empty");
+        }
+        
+        // yt-dlp doesn't have native pagination, so we use a fixed page size
+        // and fetch only the requested page worth of results
         const RESULTS_PER_PAGE: u32 = 20;
-        const MAX_PAGE: u32 = 100; // Limit to prevent excessive results
+        const MAX_PAGE: u32 = 50; // Reduced limit to prevent excessive queries
         
         if page == 0 {
             bail!("Page number must be at least 1");
@@ -98,9 +105,15 @@ impl Instance {
             bail!("Page number too large (max {})", MAX_PAGE);
         }
         
-        let total_results = page * RESULTS_PER_PAGE;
+        // Calculate range for this page
+        let end_result = page
+            .checked_mul(RESULTS_PER_PAGE)
+            .ok_or_else(|| anyhow!("Page number overflow"))?;
         
-        let search_query = format!("ytsearch{total_results}:{query}");
+        // Use ytsearch to get results in the range we need
+        // Note: yt-dlp doesn't support offset, so we still fetch from start
+        // but this is a limitation of yt-dlp's search feature
+        let search_query = format!("ytsearch{end_result}:{query}");
         let temp_dir = std::env::temp_dir();
         
         let args = vec![
@@ -117,7 +130,7 @@ impl Instance {
         
         // Parse the output - each line is a JSON object
         let output = result.output();
-        let mut videos = Vec::new();
+        let mut all_videos = Vec::new();
         
         for line in output.lines() {
             if line.trim().is_empty() {
@@ -126,16 +139,16 @@ impl Instance {
             
             if let Ok(value) = serde_json::from_str::<Value>(line) {
                 if let Some(video) = Self::parse_ytdlp_item(&value) {
-                    videos.push(video);
+                    all_videos.push(video);
                 }
             }
         }
         
         // Return only the last page of results for pagination
         let start_idx = ((page - 1) * RESULTS_PER_PAGE) as usize;
-        let videos: Vec<YoutubeVideo> = videos.into_iter().skip(start_idx).collect();
+        let paginated_videos: Vec<YoutubeVideo> = all_videos.into_iter().skip(start_idx).collect();
         
-        Ok(videos)
+        Ok(paginated_videos)
     }
     
     /// Parse a single video entry from yt-dlp JSON output
@@ -193,19 +206,32 @@ impl Instance {
 
         domains.shuffle(&mut rand::rng());
 
-        for domain in domains {
+        let mut last_error = None;
+        for domain in &domains {
             let url = format!("{domain}/api/v1/trending?type=music&region={region}");
             
-            if let Ok(result) = self.client.get(&url).send().await
-                && result.status() == StatusCode::OK
-                && let Ok(text) = result.text().await
-                && let Some(videos) = Self::parse_youtube_options(&text)
-            {
-                return Ok(videos);
+            match self.client.get(&url).send().await {
+                Ok(result) if result.status() == StatusCode::OK => {
+                    if let Ok(text) = result.text().await {
+                        if let Some(videos) = Self::parse_youtube_options(&text) {
+                            return Ok(videos);
+                        }
+                    }
+                }
+                Err(e) => last_error = Some(e.to_string()),
+                _ => {}
             }
         }
         
-        bail!("Unable to fetch trending music from any Invidious instance")
+        let error_msg = if let Some(err) = last_error {
+            format!("Unable to fetch trending music for region '{}' from {} Invidious instances. Last error: {}", 
+                    region, domains.len(), err)
+        } else {
+            format!("Unable to fetch trending music for region '{}' from {} Invidious instances", 
+                    region, domains.len())
+        };
+        
+        bail!(error_msg)
     }
 
     fn parse_youtube_options(data: &str) -> Option<Vec<YoutubeVideo>> {
@@ -338,12 +364,25 @@ mod tests {
     async fn test_search_with_ytdlp_page_validation() {
         // Test page 0 is rejected
         let result = Instance::search_with_ytdlp("test", 0).await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "Expected error for page 0, but got Ok");
         assert!(result.unwrap_err().to_string().contains("at least 1"));
 
-        // Test page > MAX_PAGE is rejected  
-        let result = Instance::search_with_ytdlp("test", 101).await;
-        assert!(result.is_err());
+        // Test page > MAX_PAGE is rejected
+        let result = Instance::search_with_ytdlp("test", 51).await;
+        assert!(result.is_err(), "Expected error for page > MAX_PAGE, but got Ok");
         assert!(result.unwrap_err().to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn test_search_with_ytdlp_empty_query() {
+        // Test empty query is rejected
+        let result = Instance::search_with_ytdlp("", 1).await;
+        assert!(result.is_err(), "Expected error for empty query, but got Ok");
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+
+        // Test whitespace-only query is rejected
+        let result = Instance::search_with_ytdlp("   ", 1).await;
+        assert!(result.is_err(), "Expected error for whitespace query, but got Ok");
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
     }
 }
